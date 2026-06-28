@@ -1,0 +1,563 @@
+---
+title: "ZavRadIgraci"
+author: "36548173 Rossini Marin"
+date: "2025-03-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(readr)
+library(dplyr)
+library(class)
+library(randomForest)
+library(tidyverse)
+library(slider)
+library(caret)
+library(e1071)
+library(nnet)
+library(ggplot2)
+library(reshape2)
+library(gridExtra)
+library(lubridate)
+library(scales)
+library(factoextra)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Uvod
+
+Ovdje ću se baviti analizom igrača i njihovim statistikama.
+
+Prvo ću provesti kratku obradu i čišćenje podataka kako bih imao kvalitetan skup podataka za eksploratornu analizu, a kasnije i za grupiranje igrača (clustering)
+
+## Učitavanje podataka
+
+```{r}
+players <- read_csv("csv2/Player Per Game.csv")
+players %>% filter(player == "Nikola Jokić") %>% arrange(desc(pts_per_game))
+```
+
+```{r}
+playersAdv <- read_csv("csv2/Advanced.csv")
+glimpse(playersAdv)
+```
+
+### Spajanje osnovnih i naprednijih podataka u jedan skup podataka i filtriranje korisnih podataka
+
+Spojit ćemo dva učitana skupa podataka u jedan pomoću season id igrača (parametar kojim razlikujemo svaku sezonu pojedinog igrača) i izbaciti nepotrebne stupce.
+
+Sljedeći zadatak je odlučiti koji podaci su korisni i vrijedni. Budući da prije sezone 1980. dosta podataka je nepotpuno, odlučio sam ih izbaciti. Isto tako, procijenio sam da igrači koji nisu skupili dovoljno minuta u pojedinoj sezoni (granicu sam postavio na 1600 minuta, što je skoro točno 40% mogućih minuta (ukupan broj minuta je 82 utakmice \* 48 minuta = 3936 minuta)) nisu korisni za analizu te sam ih isto odbacio. Na kraju, uklonio sam one redove gdje je tm (team) = TOT jer to samo znači da je igrač promijenio klub i imamo dvostruke podatke. Na kraju sam još uklonio nepotpune redove i dobio skup podataka od oko 6400 sezona statistika igrača.
+
+```{r}
+playersAll <- players %>%
+  left_join(playersAdv %>% select(-season, -player, -player_id, -birth_year, -pos, -age, -experience, -lg, -tm, -g), by = "seas_id")
+playersAll %>% filter(mp > 1600 & season > 1980 & tm != "TOT") %>% select(-birth_year, -lg, -gs) -> playersAll
+playersAll %>% filter(complete.cases(playersAll)) -> playersClean
+head(playersClean)
+```
+
+## Usporedba različitih era NBA
+
+Zanima nas kako su se pojedini segmenti košarke promijenili kroz vrijeme. Zato sam odlučio dodati novi stupac *era* koji označava u kojem razdoblju NBA se odvijala ta sezona.
+
+Najjednostavnije sam odlučio podijeliti ere u tri dijela prema različitim desetljećima:
+
+-   80/90s - statistike igrača do sezone 2000.
+
+-   2000s - statistike igrača od sezone 2001. do sezone 2010.
+
+-   2010s - statistike igrača od sezone 2011. do danas
+
+```{r}
+playersClean %>% mutate(era = ifelse(season < 2001, "80/90s", ifelse(season > 2000 & season < 2011, "2000s", "2010s"))) -> playersClean
+
+playersClean$era <- factor(
+  playersClean$era,
+  levels = c("80/90s", "2000s", "2010s")
+)
+```
+
+### Razlika u prosječnom broju koševa
+
+Često se priča kako se u novije vrijeme u NBA ne igra obrana, što potvrđuje veći broj prosječnih poena postignutih na utakmici. No, postižu li košarkaši danas više poena u prosjeku u odnosu na prije 30 godina?
+
+```{r}
+playersClean2 <- playersClean %>%
+  group_by(era) %>%
+  mutate(
+    mean_pts_pg = mean(pts_per_game, na.rm = TRUE),
+  ) %>%
+  ungroup()
+
+ggplot(playersClean2, aes(x = pts_per_game)) +
+  geom_bar(color = "dodgerblue") +
+  geom_vline(aes(xintercept = mean_pts_pg), color = "red") +
+  labs(title = "Usporedba prosječnog broja koševa igrača kroz povijest",
+       x = "Prosječan broj koševa",
+       y = "Količina") +
+  theme_minimal() + facet_grid(era ~ .) -> l1
+ggsave("ere1.png", bg = "white")
+```
+
+Pomalo iznenađujuće, djeluje da danas prosječan NBA košarkaš ubacuje sličan broj koševa po utakmici kao i prije 30 godina.
+
+### Razlika u prosječnom broju asistencija po utakmici
+
+Budući da se igra ubrzala i igra se na veći broj posjeda, je li se povećao i broj asistencija?
+
+```{r}
+playersClean2 <- playersClean %>%
+  group_by(era) %>%
+  mutate(
+    mean_ast_pg = mean(ast_per_game, na.rm = TRUE),
+  ) %>%
+  ungroup()
+
+ggplot(playersClean2, aes(x = ast_per_game)) +
+  geom_bar(fill = "dodgerblue") +
+  geom_vline(aes(xintercept = mean_ast_pg), color = "red") +
+  labs(title = "Usporedba prosječnog broja asistencija igrača kroz povijest",
+       x = "Prosječan broj asistencija",
+       y = "Količina") +
+  theme_minimal() + facet_grid(era ~ .)
+```
+
+Odgovor: nije! Prosječan broj asistencija ostao je isti u posljednjih 30 godina.
+
+### Razlika u volumenu i postotku pogođenih slobodnih bacanja
+
+Kakva je razlika u količini izvedenih slobodnih bacanja? Izvode li košarkaši danas više slobodnih bacanja? Izvode li ih bolje?
+
+```{r}
+playersClean2 <- playersClean %>%
+  group_by(era) %>%
+  mutate(
+    mean_ft_pg = mean(ft_per_game, na.rm = TRUE),
+    mean_ft_percent = mean(ft_percent, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+ggplot(playersClean2, aes(x = ft_per_game, y = ft_percent)) +
+  geom_point(color = "dodgerblue") +
+  geom_vline(aes(xintercept = mean_ft_pg), color = "red") +
+  geom_hline(aes(yintercept = mean_ft_percent), color = "red", ) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1, scale = 100)) +
+  labs(title = "Usporedba slobodnih bacanja igrača kroz povijest",
+       x = "Prosječan broj slobodnih bacanja",
+       y = "Postotak pogođenih slobodnih bacanja") +
+  theme_minimal() + facet_grid(era ~ .) -> h1
+ggsave("graf6.png", plot = last_plot(), width = 10, height = 8, dpi = 300, bg = "white")
+```
+
+Opet, rekao bih pomalo iznenađujuće, košarkaši danas čak izvode i malo manje bacanja u prosjeku nego u prošlosti. Što se tiče same uspješnosti, malo veći postotak pogođenih slobodnih bacanja imaju košarkaši današnjice u odnosu na one u prošlosti.
+
+### Razlika u volumenu i kvaliteti šuta za tri poena
+
+Kakva je razlika u količini i kvaliteti šuta za tri poena?
+
+```{r}
+playersClean2 <- playersClean %>%
+  group_by(era) %>%
+  mutate(
+    mean_x3p_pg = mean(x3p_per_game, na.rm = TRUE),
+    mean_x3p_percent = mean(x3p_percent, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+ggplot(playersClean2, aes(x = x3p_per_game, y = x3p_percent)) +
+  geom_point(color = "dodgerblue") +
+  geom_vline(aes(xintercept = mean_x3p_pg), color = "red") +
+  geom_hline(aes(yintercept = mean_x3p_percent), color = "red", ) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1, scale = 100)) +
+  labs(title = "Usporedba šuta za tri poena igrača kroz povijest",
+       x = "Prosječan broj pogođenih trica",
+       y = "Postotak pogođenih trica") +
+  theme_minimal() + facet_grid(era ~ .) -> g
+
+ggsave("graf5.png", plot = g, width = 10, height = 8, dpi = 300, bg = "white")
+```
+
+Kao što je bilo očekivano, ovdje primijećujemo značajnu razliku u broju pogođenih trica. U 80-ima i 90-ima prosječan košarkaš nije imao niti blizu jedne pogođene trice po utakmici, tijekom 2000-ih skoro jednu, a danas prosječan košarkaš pogađa jednu, skoro jednu i pol tricu po utakmici. Isto tako, postotak uspješnosti šuta za tri poena se isto podigao sa malo manje od 25% uspješnosti iz 80/90-ih do 35% danas.
+
+## Usporedba igrača svih era
+
+Provjerili smo postoje li i kakve su razlike igrača u različitim razdobljima NBA. Sad ćemo pokušati usporediti igrače općenito.
+
+### Zabijaju li više igrači koji šutiraju više trica?
+
+```{r}
+ggplot(playersClean, aes(x = x3p_per_game, y = pts_per_game)) + 
+  geom_point(color = "dodgerblue") +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Povezanost šuta za tri poena i prosječnog broja koševa",
+       x = "Prosječan broj pogođenih trica",
+       y = "Prosječan broj poena") +
+  theme_minimal()
+```
+
+Korelacija postoji, ali nije jaka. U prošlosti šut za tri poena nije bio tako presudan u postizanju većeg broja koševa, ali u današnjici je teško zamisliti da će netko biti najbolji strijelac lige bez šutiranja trice.
+
+### Povezanost postotka šuta za tri poena i postotka pogođenih slobodnih bacanja
+
+Pogađaju li bolje slobodna bacanja oni igrači koji dobro šutiraju trice? U obzir ulaze isključivo igrači s barem jednim pokušajem za tri poena po utakmici.
+
+```{r}
+pom <- playersClean %>% filter(x3pa_per_game > 1)
+
+ggplot(pom, aes(x = x3p_percent, y = ft_percent)) + 
+  geom_point(color = "dodgerblue") +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1, scale = 100)) +
+  scale_x_continuous(
+    labels = percent_format(accuracy = 1, scale = 100)) +
+  labs(title = "Povezanost postotka šuta za tri poena i postotka pogođenih slobodnih bacanja",
+       x = "Postotak pogođenih trica",
+       y = "Postotak pogođenih slobodnih bacanja") +
+  theme_minimal()
+ggsave("graf7.png", plot = last_plot(), width = 10, height = 8, dpi = 300, bg = "white")
+```
+
+Određena povezanost postoji. Obično igrači koji dobro šutiraju za tri poena imaju i dobar postotak slobodnih bacanja, ali veza nije tako jaka te postoje igrači dobro šutiraju trice, a loše bacanja i obratno.
+
+### Prosječan broj poena po pozicijama igrača
+
+Igrači na različitim pozicijama imaju različite karakteristike. Postoji li razlika u prosječnom broju poena igrača na različitim pozicijama?
+
+```{r}
+playersClean2 <- playersClean %>%
+  group_by(pos) %>%
+  mutate(
+    mean_pts_pg = mean(pts_per_game, na.rm = TRUE),
+  ) %>%
+  ungroup()
+
+ggplot(playersClean2, aes(x = pts_per_game)) +
+  geom_bar(color = "dodgerblue", size = 2) +
+  geom_vline(aes(xintercept = mean_pts_pg), color = "red") +
+  labs(title = "Usporedba prosječnog broja koševa igrača prema poziciji",
+       x = "Prosječan broj koševa",
+       y = "Količina") +
+  theme_minimal() + facet_grid(pos ~ .)
+ggsave("graf8.png", plot = last_plot(), width = 10, height = 8, dpi = 300, bg = "white")
+```
+
+Baš i ne. Što je i očekivano, na svakoj poziciji postoje igrači koji zabijaju više i oni igrači koji zabijaju manje koševa. Broj prosječnih poena ne ovisi o poziciji, već o kvaliteti igrača.
+
+### Prosječan broj skokova po pozicijama igrača
+
+Postoji li razlika u prosječnom broju skokova igrača na različitim pozicijama?
+
+```{r}
+playersClean2 <- playersClean %>%
+  group_by(pos) %>%
+  mutate(
+    mean_trb_pg = mean(trb_per_game, na.rm = TRUE),
+  ) %>%
+  ungroup()
+
+ggplot(playersClean2, aes(x = trb_per_game)) +
+  geom_bar(color = "dodgerblue", size = 1) +
+  geom_vline(aes(xintercept = mean_trb_pg), color = "red") +
+  labs(title = "Usporedba prosječnog broja skokova igrača prema poziciji",
+       x = "Prosječan broj skokova",
+       y = "Količina") +
+  theme_minimal() + facet_grid(pos ~ .)
+ggsave("graf9.png", plot = last_plot(), width = 10, height = 8, dpi = 300, bg = "white")
+```
+
+Ovdje smo i očekivali neku razliku. Jasno je da će visoki igrači (centri, krilni igrači) imati više skokova u prosjeku od onih nižih (bekovi). Naravno, uvijek postoje iznimke i neki bekovi koji su imali puno skokova u prosjeku, ali kad se sagleda šira slika ovaj rezultat je očekivan.
+
+### Prosječan broj asistencija po pozicijama igrača
+
+Kakva je situacija kad su u pitanju asistencije?
+
+```{r}
+playersClean2 <- playersClean %>%
+  group_by(pos) %>%
+  mutate(
+    mean_ast_pg = mean(ast_per_game, na.rm = TRUE),
+  ) %>%
+  ungroup()
+
+ggplot(playersClean2, aes(x = ast_per_game)) +
+  geom_bar(color = "dodgerblue", size = 1) +
+  geom_vline(aes(xintercept = mean_ast_pg), color = "red") +
+  labs(title = "Usporedba prosječnog broja asistencija igrača prema poziciji",
+       x = "Prosječan broj asistencija",
+       y = "Količina") +
+  theme_minimal() + facet_grid(pos ~ .)
+ggsave("graf10.png", plot = last_plot(), width = 10, height = 8, dpi = 300, bg = "white")
+```
+
+Pozicija na kojoj igrači imaju uvjerljivo najviše asistencija jest PG (point guard), i to očekivano. To je pozicija za razigravača, playmakera momčadi. Tim igračima je obično glavni zadatak razigravati momčad i dijeliti asistencije. Ipak, u novije doba, pozicija igrača nije tako bitna po pitanju dijeljenja asistencija te postoji više slučajeva gdje su i centri glavni razigravači momčadi (najpoznatiji je Nikola Jokić).
+
+### Na kojoj poziciji igrači najviše doprinose napadu?
+
+Provjerili smo kako pozicija utječe na prosječan broj poena i nismo naišli na neku povezanost. Ako gledamo ukupni napadački doprinos situacija će možda biti malo drugačija.\
+Gledamo metriku Offensive Box Plus/Minus (OBPM), koja u obzir uzima brojne parametre, poput broja koševa, asistencija, napadačkih skokova, šuta, izgubljenih lopti i slično. Ta je metrika preciznija za bekove nego za visoke igrače jer se u metriku ne može ubaciti vrijednost dobrog kretanja igrača u napadu, ali i dalje je vrlo pouzdana i detaljna.
+
+```{r}
+playersClean2 <- playersClean %>%
+  group_by(pos) %>%
+  mutate(
+    mean_obpm = mean(obpm, na.rm = TRUE),
+  ) %>%
+  ungroup()
+
+ggplot(playersClean2, aes(x = obpm)) +
+  geom_bar(fill = "dodgerblue", width = 0.1) +
+  geom_vline(aes(xintercept = mean_obpm), color = "red") +
+  labs(title = "Napadački doprinosi igrača prema poziciji",
+       x = "Prosječan napadački doprinos",
+       y = "Količina") +
+  theme_minimal() + facet_grid(pos ~ .) -> s1
+ggsave("graf11.png", plot = last_plot(), width = 10, height = 8, dpi = 300, bg = "white")
+```
+
+Rezultat pokazuje malo veći prosjek za razigravače momčadi, što ima smisla jer razigravači u prosjeku najviše imaju loptu u svom posjedu te time najviše doprinose napadu (pogotovo ako svoj posao rade na visokoj razini).
+
+### Na kojoj poziciji igrači najviše doprinose obrani?
+
+Kakva je situacija kad se gleda doprinos u obrani?
+
+Promatramo metriku Defensive Box Plus/Minus (DBPM), koja je najpouzdanija metrika koju imamo dostupnu u ovom skupu podataka što se tiče obrane. Metriku ipak treba uzeti s dozom opreza jer je jako teško dobro kvantificirati doprinos u obrani.
+
+```{r}
+playersClean2 <- playersClean %>%
+  group_by(pos) %>%
+  mutate(
+    mean_dbpm = mean(dbpm, na.rm = TRUE),
+  ) %>%
+  ungroup()
+
+ggplot(playersClean2, aes(x = dbpm)) +
+  geom_bar(fill = "dodgerblue") +
+  geom_vline(aes(xintercept = mean_dbpm), color = "red") +
+  labs(title = "Obrambeni doprinos igrača prema poziciji",
+       x = "Prosječan obrambeni doprinos",
+       y = "Količina") +
+  theme_minimal() + facet_grid(pos ~ .) -> s2
+grid.arrange(s1, s2, ncol = 2) -> s
+ggsave("graf13.png", plot = s, width = 10, height = 8, dpi = 300, bg = "white")
+```
+
+Najveći doprinos u obrani u prosjeku imaju centri. To ima smisla jer oni sa svojom građom stvaraju najveću prepreku u postizanju koševa, naročito u reketu. U ostalim pozicijama nema neke velike razlike u metrici.
+
+## Clustering
+
+U ovom dijelu izrađujem modele za grupiranje igrača na temelju njihovih statistika iz pojedinih sezona.
+
+Koristit ću K-means koji mi djeluje kao najprikladniji model za ovu prigodu.
+
+### Model s naprednijim statistikama igrača
+
+```{r}
+nba_clustering <- playersClean %>%
+  select(pts_per_game, trb_per_game, ast_per_game,
+         stl_per_game, blk_per_game, x3pa_per_game, ts_percent,
+         usg_percent, per, obpm, dbpm)
+
+nba_scaled <- nba_clustering %>% scale()
+
+set.seed(3000)
+kmeans_model <- kmeans(nba_scaled, centers = 3, nstart = 25)
+
+nba_clustering$cluster <- factor(kmeans_model$cluster)
+
+fviz_cluster(kmeans_model, data = nba_scaled,
+             geom = "point", main = "Clustering NBA igrača - naprednije statistike",
+             repel = TRUE)
+
+nba_clustering %>%
+  group_by(cluster) %>%
+  summarise(across(pts_per_game:dbpm, mean, .names = "avg_{.col}")) -> clstr
+clstr
+ggsave("c1.png", bg = "white")
+```
+
+Dobili smo lijepo grupiranje tri grupe igrača.
+
+Grupa 1 predstavlja visoke igrače, uglavnom centre, što možemo primijetiti u velikom broju skokova i blokada, te većem defenzivnom doprinosu.
+
+Grupa 2 predstavlja prosječne NBA bekove i igrače koji ne igraju najvažnije uloge u svojim momčadima, ali su i dalje stožerni igrači svojih momčadi. Niti u jednom segmetu ne iskaču iz prosjeka.
+
+Grupa 3 predstavlja ponajbolje bekove NBA lige koji predvode svoje momčadi u napadu. Ubacuju najviše poena u prosjeku te imaju najviše asistencija, samim time i najveći napadački doprinos (OBPM).
+
+### Model s osnovnim statistikama (3 grupe)
+
+Ovaj model koristi samo osnovne statistike: prosječan broj koševa, skokova, asistencija, ukradenih lopti i blokada po utakmici.
+
+Izrađen je kako bih ga mogao usporediti s modelom koji koristi i naprednije statistike.
+
+```{r}
+nba_clustering2 <- playersClean %>%
+  select(pts_per_game, trb_per_game, ast_per_game,
+         stl_per_game, blk_per_game)
+
+nba_scaled <- nba_clustering2 %>% scale()
+
+set.seed(3000)
+kmeans_model <- kmeans(nba_scaled, centers = 3, nstart = 30)
+
+nba_clustering2$cluster <- factor(kmeans_model$cluster)
+
+fviz_cluster(kmeans_model, data = nba_scaled,
+             geom = "point", main = "Clustering NBA igrača - osnovne statistike (3 grupe)",
+             repel = TRUE)
+
+nba_clustering2 %>%
+  group_by(cluster) %>%
+  summarise(across(pts_per_game:blk_per_game, mean, .names = "avg_{.col}")) -> clstr
+clstr
+ggsave("c2.png", bg = "white")
+```
+
+Rezultat je vrlo sličan prošlom modelu. Imamo opet iste tri grupe igrača s vrlo sličnim brojevima. Opisi grupa koji su napisani za prošli model vrijede i za ovaj.
+
+### Model s osnovnim statistikama (4 grupe)
+
+Ovaj model sadrži iste statistike kao i prošli, ali grupira u četiri grupe, a ne tri.
+
+Iako vjerojatno više ima smisla grupacija u 3 grupe kao u prethodnom modelu (jer u ovom dolazi do većih preklapanja), zadržao sam ovaj model jer su mi se svidjeli rezultati u tablici i mogao sam interpretirati svaku od četiri nastale grupe:
+
+-   grupa 1: prikazuje statistike prosječnog igrača u NBA, niti u jednom paramteru ne iskače iz prosjeka
+
+-   grupa 2: prikazuje prosjeke ponajboljih igrača u ligi - u svakoj rubrici su bolji od prosječnih igrača, dok najviše odskaču u broju koševa u prosjeku
+
+-   grupa 3: prikazuje statistike dobrih playmakera - iznadprosječan broj poena, grupa sa najviše asistencija i ukradenih lopti, što obično jesu karakteristike dobrih playmakera
+
+-   grupa 4: prikazuje statistike dobrih centara/visokih igrača - iznadprosječan broj poena i uvjerljivo najviše skokova i blokada od svih grupa
+
+U ovom modelu prva grupa predstavlja prosječne igrače na pozicijama *shooting guarda* (SG) i *small forwarda* (SF), druga grupa najbolje igrače na tim pozicijama i playmakere koji postižu više poena (PG), treća grupa igrače na poziciji *point guarda* (PG), dok četrvta grupa predstavlja visoke igrače, uglavnom *centre* (C) i *power fowarde* (PF).
+
+Razlika u odnosu na prošli model je ta što smo dobili dodatnu grupu koja predstavlja igrače na poziciji playmakera što je skup igrača koji se može zasebno grupirati. Istu stvar smo mogli dobiti u modelu s naprednijim statistikama, ali zbog redundantnosti nismo.
+
+```{r}
+nba_clustering3 <- playersClean %>%
+  select(pts_per_game, trb_per_game, ast_per_game,
+         stl_per_game, blk_per_game)
+
+nba_scaled <- nba_clustering3 %>% scale()
+
+set.seed(3000)
+kmeans_model <- kmeans(nba_scaled, centers = 4, nstart = 30)
+
+nba_clustering3$cluster <- factor(kmeans_model$cluster)
+
+fviz_cluster(kmeans_model, data = nba_scaled,
+             geom = "point", main = "Clustering NBA igrača - osnovne statistike (4 grupe)",
+             repel = TRUE)
+
+nba_clustering3 %>%
+  group_by(cluster) %>%
+  summarise(across(pts_per_game:blk_per_game, mean, .names = "avg_{.col}"))
+ggsave("c3.png", bg = "white")
+```
+
+## Zaključak
+
+Igrače se može grupirati na puno različitih načina. Možemo ih grupirati prema razdobljima, prema pozicijima, prema njihovoj kvaliteti. Kombinacijom zadnje stvari dvije dobit ćemo nešto poput ovih modela, gdje smo dobili nekoliko različitih grupa. Što se tiče samih pozicija, najlakša grupacija je na visoke igrače (one koji igraju na pozicijama krila i centra) i one niže (bekove). Obično visoki igrači imaju više skokova i blokada, a bekovi više asistencija i šuteva za tri poena. Ipak, danas razlike između pozicija postaju sve manje te postaje normalno da i visoki igrači šutiraju trice i čak razigravaju suigrače, što je nekad u prošlosti bilo teško zamislivo.
+
+## Timovi
+
+```{r}
+timovi <- read_csv("csv2/Team Stats Per Game.csv")
+timovi %>% filter(complete.cases(timovi)) -> timoviC
+timoviC %>% mutate(era = ifelse(season < 2001, "80/90s", ifelse(season > 2000 & season < 2011, "2000s", "2010s"))) -> timoviC
+timoviC$era <- factor(
+  timoviC$era,
+  levels = c("80/90s", "2000s", "2010s")
+)
+timoviC
+```
+
+```{r}
+tc <- timoviC %>%
+  group_by(era) %>%
+  mutate(
+    mean_pts_pg = mean(pts_per_game, na.rm = TRUE),
+  ) %>%
+  ungroup()
+
+ggplot(tc, aes(x = pts_per_game)) +
+  geom_bar(color = "dodgerblue") +
+  geom_vline(aes(xintercept = mean_pts_pg), color = "red") +
+  labs(title = "Usporedba prosječnog broja koševa timova kroz povijest",
+       x = "Prosječan broj koševa",
+       y = "Količina") +
+  theme_minimal() + facet_grid(era ~ .) -> l2
+grid.arrange(l1, l2, ncol = 2) -> l
+ggsave("ereusp.png", plot = l, width = 10, height = 8, dpi = 300, bg = "white")
+```
+
+```{r}
+tc <- timoviC %>%
+  group_by(era) %>%
+  mutate(
+    mean_ft_pg = mean(ft_per_game, na.rm = TRUE),
+    mean_ft_percent = mean(ft_percent, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+ggplot(tc, aes(x = ft_per_game, y = ft_percent)) +
+  geom_point(color = "dodgerblue") +
+  geom_vline(aes(xintercept = mean_ft_pg), color = "red") +
+  geom_hline(aes(yintercept = mean_ft_percent), color = "red", ) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1, scale = 100)) +
+  labs(title = "Usporedba slobodnih bacanja timova kroz povijest",
+       x = "Prosječan broj slobodnih bacanja",
+       y = "Postotak pogođenih slobodnih bacanja") +
+  theme_minimal() + facet_grid(era ~ .) -> h2
+grid.arrange(h1, h2, ncol = 2) -> h
+ggsave("ereusp2.png", plot = h, width = 10, height = 8, dpi = 300, bg = "white")
+```
+
+```{r}
+tc <- timoviC %>%
+  group_by(era) %>%
+  mutate(
+    mean_x3p_pg = mean(x3p_per_game, na.rm = TRUE),
+    mean_x3p_percent = mean(x3p_percent, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+ggplot(tc, aes(x = x3p_per_game, y = x3p_percent)) +
+  geom_point(color = "dodgerblue") +
+  geom_vline(aes(xintercept = mean_x3p_pg), color = "red") +
+  geom_hline(aes(yintercept = mean_x3p_percent), color = "red", ) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1, scale = 100)) +
+  labs(title = "Usporedba šuta za tri poena timova kroz povijest",
+       x = "Prosječan broj pogođenih trica",
+       y = "Postotak pogođenih trica") +
+  theme_minimal() + facet_grid(era ~ .) -> go
+grid.arrange(g, go, ncol = 2) -> gog
+ggsave("ereusp3.png", plot = gog, width = 10, height = 8, dpi = 300, bg = "white")
+```
+
+```{r}
+nba_clustering2 <- playersClean %>%
+  select(pts_per_game, trb_per_game, ast_per_game,
+         stl_per_game, blk_per_game)
+
+nba_scaled <- nba_clustering2 %>% scale()
+
+set.seed(3000)
+kmeans_model <- kmeans(nba_scaled, centers = 2, nstart = 30)
+
+nba_clustering2$cluster <- factor(kmeans_model$cluster)
+
+fviz_cluster(kmeans_model, data = nba_scaled,
+             geom = "point", main = "Clustering NBA igrača - osnovne statistike (2 grupe)",
+             repel = TRUE)
+
+nba_clustering2 %>%
+  group_by(cluster) %>%
+  summarise(across(pts_per_game:blk_per_game, mean, .names = "avg_{.col}")) -> clstr
+clstr
+ggsave("c4.png", bg = "white")
+```

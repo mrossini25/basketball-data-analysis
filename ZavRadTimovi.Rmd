@@ -1,0 +1,893 @@
+---
+title: "zavRad1"
+author: "36548173 Rossini Marin"
+date: "2025-03-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(readr)
+library(dplyr)
+library(class)
+library(randomForest)
+library(tidyverse)
+library(slider)
+library(caret)
+library(e1071)
+library(nnet)
+library(ggplot2)
+library(reshape2)
+library(gridExtra)
+library(lubridate)
+library(factoextra)
+library(scales)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Učitavanje prvih datasetova
+
+Pred nama se nalazi dataset sa (ne)potpunim podacima svih NBA utakmica u povijesti lige.
+
+```{r}
+nbagames <- read_csv("csv/game.csv")
+head(nbagames)
+glimpse(nbagames)
+summary(nbagames)
+```
+
+S obzirom da nas zanimaju potpuniji podaci, koji su dostupni od sezone 1985/1986, ranije podatke ćemo ukloniti.
+
+```{r}
+nbagamesClear <- nbagames %>% filter(complete.cases(nbagames))
+```
+
+## Podjela na regularnu sezonu i playoff
+
+Uklanjamo nepotrebne stupce i dijelimo dataset na regularnu sezonu i playoff. S obzirom na veću količinu podataka, mi ćemo promatrati podatke iz regularne sezone.
+
+```{r}
+interval <- dmy("1.7.1985") %--% today()
+nbagamesClear %>% filter(game_date %within% interval) -> nbaK
+nbaK <- nbaK %>% select(-min, -video_available_home, -video_available_away)
+
+nbaK %>% filter(season_id > 30000) -> nbaPlayoffs
+nbaK %>% filter(season_id < 30000 & season_id > 20000) -> nbaRS
+head(nbaRS)
+```
+
+## Dodavanje stupca gamesPlayed, numberOfWins, WinPCT
+
+U ovom dijeli dodajem tri dodatna stupca koja će biti korisna u kasnijoj analizi:\
+1) gamesPlayedHome/Away - broj odigranih utakmica u tekućoj sezoni
+
+2)  numberOfWinsHome/Away - broj pobjeda u tekućoj sezoni
+
+3)  Home/AwayTeamWinPCT - postotak pobjeda momčadi u tekućoj sezoni, najbolji parametar za praćenje uspješnosti momčadi (jer obično ekipe nemaju uvijek jednak broj odigranih utakmica)
+
+```{r}
+nbaRS %>% mutate(RowID = row_number()) %>%
+  group_by(team_id_home, season_id) %>%
+  arrange(game_date) %>%
+  mutate(winHome = ifelse(wl_home == "W", 1, 0)) %>%
+  mutate(numberofWinsHome = lag(cumsum(winHome), default = 0),
+         CumHomeGames = row_number() - 1,
+         HomeTeamPCT = ifelse(CumHomeGames > 0, numberofWinsHome / CumHomeGames, NA)) %>%
+  ungroup() %>%
+  group_by(team_id_away, season_id) %>%
+  arrange(game_date) %>%
+  mutate(winAway = ifelse(wl_away == "W", 1, 0)) %>%
+  mutate(numberofWinsAway = lag(cumsum(winAway), default = 0),
+         CumAwayGames = row_number() - 1,
+         AwayTeamPCT = ifelse(CumAwayGames > 0, numberofWinsAway / CumAwayGames, NA)) %>%
+  ungroup() %>%
+  arrange(RowID) %>%
+  select(-RowID, -winHome, -CumHomeGames, -winAway, -CumAwayGames)
+
+```
+
+```{r}
+pomocna_tablica <- nbaRS %>%
+  mutate(
+    team_id = team_id_home,
+    opp_id = team_id_away,
+    fgm = fgm_home,
+    fga = fga_home,
+    fg_pct = fg_pct_home,
+    fg3m = fg3m_home,
+    fg3a = fg3a_home,
+    fg3_pct = fg3_pct_home,
+    ftm = ftm_home,
+    fta = fta_home,
+    ft_pct = ft_pct_home,
+    oreb = oreb_home,
+    dreb = dreb_home,
+    reb = reb_home,
+    ast = ast_home,
+    stl = stl_home,
+    blk = blk_home,
+    tov = tov_home,
+    pf = pf_home,
+    ptsScored = pts_home,
+    ptsConceded = pts_away,
+    plus_minus = plus_minus_home,
+    wl = wl_home
+  ) %>%
+  select(game_date, season_id, team_id, opp_id, fgm, fga, fg_pct, fg3m, fg3a, fg3_pct, ftm, fta, ft_pct, oreb, dreb, reb, ast, stl, blk, tov, pf, ptsScored, ptsConceded, plus_minus, wl) %>%
+  bind_rows(
+    nbaRS %>%
+      mutate(
+        team_id = team_id_away,
+        opp_id = team_id_home,
+        fgm = fgm_away,
+        fga = fga_away,
+        fg_pct = fg_pct_away,
+        fg3m = fg3m_away,
+        fg3a = fg3a_away,
+        fg3_pct = fg3_pct_away,
+        ftm = ftm_away,
+        fta = fta_away,
+        ft_pct = ft_pct_away,
+        oreb = oreb_away,
+        dreb = dreb_away,
+        reb = reb_away,
+        ast = ast_away,
+        stl = stl_away,
+        blk = blk_away,
+        tov = tov_away,
+        pf = pf_away,
+        ptsScored = pts_away,
+        ptsConceded = pts_home,
+        plus_minus = plus_minus_away,
+        wl = wl_away
+      ) %>%
+      select(game_date, season_id, team_id, opp_id, fgm, fga, fg_pct, fg3m, fg3a, fg3_pct, ftm, fta, ft_pct, oreb, dreb, reb, ast, stl, blk, tov, pf, ptsScored, ptsConceded, plus_minus, wl)
+  )
+```
+
+```{r}
+pomocna_tablica %>% mutate(RowID = row_number()) %>%
+  group_by(team_id, season_id) %>%
+  arrange(game_date) %>%
+  mutate(win = ifelse(wl == "W", 1, 0),
+         loss = ifelse(wl == "L", 1, 0)) %>%
+  mutate(numberofWins = lag(cumsum(win), default = 0),
+         numberofLost = lag(cumsum(loss), default = 0),
+         CumGames = row_number() - 1,
+         TeamWinPCT = ifelse(CumGames > 0, round(numberofWins / CumGames, 3), NA),
+         
+         fgmTotal = lag(cumsum(fgm), default = 0),
+         fgaTotal = lag(cumsum(fga), default = 0),
+         fgPCT = ifelse(CumGames > 0, round(fgmTotal / fgaTotal, 3), NA), #bitno
+         fg3mTotal = lag(cumsum(fg3m), default = 0),
+         fg3aTotal = lag(cumsum(fg3a), default = 0),
+         fg3PCT = ifelse(CumGames > 0, round(fg3mTotal / fg3aTotal, 3), NA), #bitno
+         ftmTotal = lag(cumsum(ftm), default = 0),
+         ftaTotal = lag(cumsum(fta), default = 0),
+         ftPCT = ifelse(CumGames > 0, round(ftmTotal / ftaTotal, 3), NA), #bitno
+         
+         orebTotal = lag(cumsum(oreb), default = 0),
+         orebAvg = ifelse(CumGames > 0, round(orebTotal / CumGames, 3), NA), #bitno
+         drebTotal = lag(cumsum(dreb), default = 0),
+         drebAvg = ifelse(CumGames > 0, round(drebTotal / CumGames, 3), NA), #bitno
+         rebTotal = lag(cumsum(reb), default = 0),
+         rebAvg = ifelse(CumGames > 0, round(rebTotal / CumGames, 3), NA), #bitno
+         astTotal = lag(cumsum(ast), default = 0),
+         astAvg = ifelse(CumGames > 0, round(astTotal / CumGames, 3), NA), #bitno
+         stlTotal = lag(cumsum(stl), default = 0),
+         stlAvg = ifelse(CumGames > 0, round(stlTotal / CumGames, 3), NA), #bitno
+         blkTotal = lag(cumsum(blk), default = 0),
+         blkAvg = ifelse(CumGames > 0, round(blkTotal / CumGames, 3), NA), #bitno
+         tovTotal = lag(cumsum(tov), default = 0),
+         tovAvg = ifelse(CumGames > 0, round(tovTotal / CumGames, 3), NA), #bitno
+         pfTotal = lag(cumsum(pf), default = 0),
+         pfAvg = ifelse(CumGames > 0, round(pfTotal / CumGames, 3), NA), #bitno
+         ptsScoredTotal = lag(cumsum(ptsScored), default = 0),
+         ptsScoredAvg = ifelse(CumGames > 0, round(ptsScoredTotal / CumGames, 3), NA), #bitno
+         ptsConcededTotal = lag(cumsum(ptsConceded), default = 0),
+         ptsConcededAvg = ifelse(CumGames > 0, round(ptsConcededTotal / CumGames, 3), NA), #bitno
+         plus_minusTotal = lag(cumsum(plus_minus), default = 0),
+         plus_minusAvg = ifelse(CumGames > 0, round(plus_minusTotal / CumGames, 3), NA), #bitno
+         ) %>%
+  ungroup() %>% arrange(RowID) %>%
+  select(-RowID, -win, -loss, -fgmTotal, -fgaTotal, -fg3mTotal, -fg3aTotal, -ftmTotal, -ftaTotal, -orebTotal, -drebTotal, -rebTotal, -astTotal, -stlTotal, -blkTotal, -tovTotal, -pfTotal, -ptsScoredTotal, -plus_minusTotal) -> pomocna_tablica
+```
+
+```{r}
+nbaRS2 <- nbaRS %>%
+  left_join(
+    pomocna_tablica %>%
+      select(game_date, season_id, team_id, CumGames, numberofWins, numberofLost, TeamWinPCT, fgPCT, fg3PCT, ftPCT, orebAvg, drebAvg, rebAvg, astAvg, stlAvg, blkAvg, tovAvg, pfAvg, ptsScoredAvg, ptsConcededAvg, plus_minusAvg) %>%
+      rename(
+        gamesPlayedHome = CumGames,
+        numberofWinsHome = numberofWins,
+        numberofLostHome = numberofLost,
+        homeTeamWinPCT = TeamWinPCT,
+        homeFGPCT = fgPCT,
+        homeFG3PCT = fg3PCT,
+        homeFTPCT = ftPCT,
+        oRebAvgHome = orebAvg,
+        dRebAvgHome = drebAvg,
+        rebAvgHome = rebAvg,
+        astAvgHome = astAvg,
+        stlAvgHome = stlAvg,
+        blkAvgHome = blkAvg,
+        tovAvgHome = tovAvg,
+        pfAvgHome = pfAvg,
+        ptsScoredAvgHome = ptsScoredAvg,
+        ptsConcededAvgHome = ptsConcededAvg,
+        plus_minusAvgHome = plus_minusAvg
+      ),
+    by = c("game_date", "season_id", "team_id_home" = "team_id")
+  ) %>%
+  left_join(
+    pomocna_tablica %>%
+      select(game_date, season_id, team_id, CumGames, numberofWins, numberofLost, TeamWinPCT, fgPCT, fg3PCT, ftPCT, orebAvg, drebAvg, rebAvg, astAvg, stlAvg, blkAvg, tovAvg, pfAvg, ptsScoredAvg, ptsConcededAvg, plus_minusAvg) %>%
+      rename(
+        gamesPlayedAway = CumGames,
+        numberofWinsAway = numberofWins,
+        numberofLostAway = numberofLost,
+        awayTeamWinPCT = TeamWinPCT,
+        awayFGPCT = fgPCT,
+        awayFG3PCT = fg3PCT,
+        awayFTPCT = ftPCT,
+        oRebAvgAway = orebAvg,
+        dRebAvgAway = drebAvg,
+        rebAvgAway = rebAvg,
+        astAvgAway = astAvg,
+        stlAvgAway = stlAvg,
+        blkAvgAway = blkAvg,
+        tovAvgAway = tovAvg,
+        pfAvgAway = pfAvg,
+        ptsScoredAvgAway = ptsScoredAvg,
+        ptsConcededAvgAway = ptsConcededAvg,
+        plus_minusAvgAway = plus_minusAvg
+      ),
+    by = c("game_date", "season_id", "team_id_away" = "team_id")
+  )
+
+tail(nbaRS2, 1000)
+```
+
+## Međusobni omjer
+
+Dodajem nove stupce za broj pobjeda svake ekipe u 10 posljednih međusobnih utakmica
+
+Za to je koristan stupac matchup_home (ili away) koji je id za međusobne utakmice dviju ekipa
+
+Problem: kratice pojedinih ekipa su se mijenjale kroz povijest te to prvo moramo riješiti.
+
+```{r}
+nbaRS2$matchup_home <- gsub("SAN", "SAS", nbaRS2$matchup_home)
+nbaRS2$matchup_home <- gsub("CHH", "CHA", nbaRS2$matchup_home)
+nbaRS2$matchup_home <- gsub("NOH", "NOP", nbaRS2$matchup_home)
+nbaRS2$matchup_home <- gsub("NOK", "NOP", nbaRS2$matchup_home)
+nbaRS2$matchup_home <- gsub("PHL", "PHI", nbaRS2$matchup_home)
+nbaRS2$matchup_home <- gsub("UTH", "UTA", nbaRS2$matchup_home)
+nbaRS2$matchup_home <- gsub("GOS", "GSW", nbaRS2$matchup_home)
+nbaRS2$matchup_home <- gsub("NJN", "BKN", nbaRS2$matchup_home)
+nbaRS2$matchup_home <- gsub("VAN", "MEM", nbaRS2$matchup_home)
+#nbaRS2 %>% filter(matchup_home == "LAL vs. SAS")
+#nbaRS2 %>% select(matchup_home) %>% group_by(matchup_home) %>% distinct() %>% arrange(matchup_home)
+```
+
+Sad kad je to riješeno, napravimo ta dva stupca.
+
+```{r}
+nbaRS2 %>% group_by(matchup_home) %>% 
+  mutate(
+    homeH2HWins = lag(slide_dbl(ifelse(wl_home == "W", 1, 0), sum, .before = 9, .complete = FALSE), default = 0),
+    awayH2HWins = lag(slide_dbl(ifelse(wl_home == "L", 1, 0), sum, .before = 9, .complete = FALSE), default = 0)
+  ) %>%
+  ungroup() -> nbaRS3
+```
+
+### Najčešći matchupi
+
+```{r}
+nbaRS3 %>% count(matchup_home) %>% arrange(desc(n))
+```
+
+#### Koliko često pobjeđuje momčad koja pogodi barem 25 trica kod kuće?
+
+Odgovor: gotovo uvijek, samo jednom je takva momčad izgubila (LA Clippersi protiv Sacramento Kingsa).
+
+```{r}
+nbaRS3 %>% filter(fg3m_home >= 25) %>% select(game_date, matchup_home, wl_home, fg3m_home)
+```
+
+## Dodan stupac ishoda utakmice (winner)
+
+Ovo je stupac koji je cilj naše prediktivne analize.
+
+```{r}
+nbaRS3 %>% mutate(winner = ifelse(wl_home == "W", "H", "A")) -> nbaRS3
+```
+
+## Kreiranje data framea s konačnim podacima svake ekipe na kraju sezone
+
+Kako bismo donositi bolje zaključke u eksploratornoj analizi, napravit ćemo data frame u kojemu ćemo imati konačne statistike svake momčadi na kraju svake regularne sezone za koje imamo dostupne podatke.
+
+```{r}
+nbaRS4 <- nbaRS3 %>% filter(complete.cases(nbaRS3))
+
+nbaRS5 <- nbaRS4 %>%
+  mutate(
+    team_id = team_id_home,
+    team_name = team_name_home,
+    opp_id = team_id_away,
+    opp_name = team_name_away,
+    gamesPlayed = gamesPlayedHome,
+    numberofWins = numberofWinsHome,
+    numberofLost = numberofLostHome,
+    teamWinPCT = homeTeamWinPCT,
+    FGPCT = homeFGPCT,
+    FG3PCT = homeFG3PCT,
+    FTPCT = homeFTPCT,
+    oRebAvg = oRebAvgHome,
+    dRebAvg = dRebAvgHome,
+    rebAvg = rebAvgHome,
+    astAvg = astAvgHome,
+    stlAvg = stlAvgHome,
+    blkAvg = blkAvgHome,
+    tovAvg = tovAvgHome,
+    pfAvg = pfAvgHome,
+    ptsScoredAvg = ptsScoredAvgHome,
+    ptsConcededAvg = ptsConcededAvgHome,
+    plus_minusAvg = plus_minusAvgHome,
+    wl = wl_home
+  ) %>%
+  select(game_date, season_id, team_id, team_name, opp_id, opp_name, game_id, matchup_home, gamesPlayed, numberofWins, numberofLost, teamWinPCT, FGPCT, FG3PCT, FTPCT, oRebAvg, dRebAvg, rebAvg, astAvg, stlAvg, blkAvg, tovAvg, pfAvg, ptsScoredAvg, ptsConcededAvg, plus_minusAvg, wl) %>%
+  bind_rows(
+    nbaRS4 %>%
+      mutate(
+        team_id = team_id_away,
+        team_name = team_name_away,
+        opp_id = team_id_home,
+        opp_name = team_name_home,
+        gamesPlayed = gamesPlayedAway,
+        numberofWins = numberofWinsAway,
+        numberofLost = numberofLostAway,
+        teamWinPCT = awayTeamWinPCT,
+        FGPCT = awayFGPCT,
+        FG3PCT = awayFG3PCT,
+        FTPCT = awayFTPCT,
+        oRebAvg = oRebAvgAway,
+        dRebAvg = dRebAvgAway,
+        rebAvg = rebAvgAway,
+        astAvg = astAvgAway,
+        stlAvg = stlAvgAway,
+        blkAvg = blkAvgAway,
+        tovAvg = tovAvgAway,
+        pfAvg = pfAvgAway,
+        ptsScoredAvg = ptsScoredAvgAway,
+        ptsConcededAvg = ptsConcededAvgAway,
+        plus_minusAvg = plus_minusAvgAway,
+        wl = wl_away
+      ) %>%
+      select(game_date, season_id, team_id, team_name, opp_id, opp_name, game_id, matchup_home, gamesPlayed, numberofWins, numberofLost, teamWinPCT, FGPCT, FG3PCT, FTPCT, oRebAvg, dRebAvg, rebAvg, astAvg, stlAvg, blkAvg, tovAvg, pfAvg, ptsScoredAvg, ptsConcededAvg, plus_minusAvg, wl)
+  )
+```
+
+```{r}
+nbaRSFinal <- nbaRS5 %>% filter(gamesPlayed == 81 | (gamesPlayed == 71 & season_id == 22020) | (gamesPlayed == 65 & season_id == 22011)) %>% arrange(season_id, desc(numberofWins))
+
+nbaRSFinal %>%
+  mutate(
+    gamesPlayed = gamesPlayed + 1,
+    numberofWins = ifelse(wl == "W", numberofWins + 1, numberofWins),
+    numberofLost = ifelse(wl == "W", numberofLost, numberofLost + 1)
+  ) -> nbaRSFinal
+
+nbaRSFinal <- nbaRSFinal %>% select(-game_date, -opp_id, -opp_name, -game_id, -matchup_home, -wl)
+
+head(nbaRSFinal)
+
+nbaRSFinal %>% count(season_id)
+```
+
+Sad kad smo uspjeli napraviti data frame koji sadrži konačne statistike momčadi na kraju sezone, možemo krenuti u vizualizaciju podataka.
+
+## Vizualizacija podataka
+
+Istražujemo kako koja statistika utječe na konačni ishod utakmice.
+
+### Povezanost broja skokova i asistencija s ishodom utakmice
+
+```{r}
+reb_melted <- melt(nbaRS4, id.vars = "winner", measure.vars = c("reb_home", "reb_away"),
+                     variable.name = "Team", value.name = "reb")
+
+ggplot(reb_melted, aes(x = winner, y = reb, fill = Team)) + 
+  geom_boxplot() + 
+  labs(title = "Prosječan broj skokova prema ishodu utakmice",
+       x = "Ishod utakmice",
+       y = "Prosječan broj skokova",
+       fill = "Tim") +
+  scale_fill_manual(labels = c("Domaći", "Gosti"), values = c("dodgerblue", "firebrick1")) +
+  theme_minimal() -> g1
+
+home_win <- subset(nbaRS4, winner == "H")
+t.test(home_win$reb_home, home_win$reb_away, paired = TRUE)
+
+away_win <- subset(nbaRS4, winner == "A")
+t.test(away_win$reb_home, away_win$reb_away, paired = TRUE)
+```
+
+```{r}
+ast_melted <- melt(nbaRS4, id.vars = "winner", measure.vars = c("ast_home", "ast_away"),
+                     variable.name = "Team", value.name = "ast")
+
+ggplot(ast_melted, aes(x = winner, y = ast, fill = Team)) + 
+  geom_boxplot() + 
+  labs(title = "Broj asistencija prema ishodu utakmice",
+       x = "Ishod utakmice",
+       y = "Broj asistencija",
+       fill = "Tim") +
+  scale_fill_manual(labels = c("Domaći", "Gosti"), values = c("dodgerblue", "firebrick1")) +
+  theme_minimal() -> g2
+
+home_win <- subset(nbaRS4, winner == "H")
+t.test(home_win$ast_home, home_win$ast_away, paired = TRUE)
+
+away_win <- subset(nbaRS4, winner == "A")
+t.test(away_win$ast_home, away_win$ast_away, paired = TRUE)
+```
+
+### Povezanost postotka šuta za 3 i ishoda utakmice
+
+```{r}
+three_point_data <- nbaRS4 %>%
+  select(winner, fg3m_home, fg3_pct_home, fg3m_away, fg3_pct_away) %>%
+  pivot_longer(
+    cols = -winner,
+    names_to = c(".value", "team_type"),
+    names_pattern = "(fg3m|fg3_pct)_(home|away)"
+  )
+
+ggplot(three_point_data, aes(x = team_type, y = fg3_pct, fill = team_type)) +
+  geom_boxplot() +
+  facet_wrap(~winner) +
+  labs(title = "Usporedba postotka trica po tipu tima i ishodu utakmice",
+       x = "Ishod utakmice",
+       y = "Postotak trica",
+       fill = "Tim") +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1, scale = 100)) +
+  scale_fill_manual(labels = c("Domaći", "Gosti"), values = c("dodgerblue", "firebrick1")) +
+  theme_minimal() -> g3
+
+grid.arrange(g1, g2, g3) -> gg
+ggsave("graf3.png", plot = gg, width = 10, height = 8, dpi = 300)
+
+home_win <- subset(nbaRS4, winner == "H")
+t.test(home_win$fg3_pct_home, home_win$fg3_pct_away, paired = TRUE)
+
+away_win <- subset(nbaRS4, winner == "A")
+t.test(away_win$fg3_pct_home, away_win$fg3_pct_away, paired = TRUE)
+```
+
+```{r}
+ggplot(nbaRSFinal, aes(x = FG3PCT, y = teamWinPCT)) + 
+  geom_point(color = "dodgerblue") +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1, scale = 100)) +
+  scale_x_continuous(
+    labels = percent_format(accuracy = 1, scale = 100)) +
+  labs(title = "Povezanost postotka šuta za 3 s postotkom pobjeda",
+       x = "Postotak trica",
+       y = "Postotak pobjeda") +
+  theme_minimal() -> g4
+
+cor.test(nbaRSFinal$FG3PCT, nbaRSFinal$teamWinPCT, method = "pearson")
+```
+
+```{r}
+ggplot(nbaRSFinal, aes(x = FG3PCT)) + 
+  geom_histogram(binwidth = 0.01, fill = "dodgerblue", color = "black") +
+  labs(x = "Postotak šuta za 3", y = "Broj timova", title = "Histogram postotka šuta za 3") +
+  theme_minimal()
+```
+
+Što bolje momčad šutira, to je vjerojatnije da će ta momčad biti bolja. Uočavamo da na kraju histogram postotka šuta za tri poena vuče čak na normalnu razdiobu.
+
+### Korelacija postotka pobjeda i broja postignutih koševa
+
+```{r}
+ggplot(nbaRSFinal, aes(x = ptsScoredAvg, y = teamWinPCT)) + 
+  geom_point(color = "dodgerblue") +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1, scale = 100)) +
+  labs(title = "Povezanost prosječnog broja koševa s postotkom pobjeda",
+       x = "Prosječan broj postignutih koševa",
+       y = "Postotak pobjeda") +
+  theme_minimal() -> g1
+cor.test(nbaRSFinal$ptsScoredAvg, nbaRSFinal$teamWinPCT, method = "pearson")
+
+```
+
+### Korelacija postotka pobjeda i broja primljenih koševa
+
+```{r}
+ggplot(nbaRSFinal, aes(x = ptsConcededAvg, y = teamWinPCT)) + 
+  geom_point(color = "dodgerblue") +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1, scale = 100)) +
+  labs(title = "Povezanost prosječnog broja primljenih koševa s postotkom pobjeda",
+       x = "Prosječan broj primljenih koševa",
+       y = "Postotak pobjeda") +
+  theme_minimal() -> g2
+cor.test(nbaRSFinal$ptsConcededAvg, nbaRSFinal$teamWinPCT, method = "pearson")
+
+```
+
+Napad dobija utakmice, a obrana prvenstva. Ova posljednja dva grafa to potvrđuju. Vidimo da je korelacija između postotka pobjeda i primljenih poena jača nego ona između postotka pobjeda i postignutih poena.
+
+### Korelacija postotka pobjeda i plus/minus statistike
+
+```{r}
+ggplot(nbaRSFinal, aes(x = plus_minusAvg, y = teamWinPCT)) + 
+  geom_point(color = "dodgerblue") +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1, scale = 100)) +
+  labs(title = "Povezanost prosječne koš razlike s postotkom pobjeda",
+       x = "Prosječna koš razlika",
+       y = "Postotak pobjeda") +
+  theme_minimal() -> g3
+
+grid.arrange(g1, g2, g3, g4, nrow = 2, ncol = 2) -> ggg
+ggsave("graf.png", plot = ggg, width = 10, height = 8, dpi = 300)
+cor.test(nbaRSFinal$plus_minusAvg, nbaRSFinal$teamWinPCT, method = "pearson")
+
+```
+
+Momčadi koje imaju oboje, naravno, postižu najbolje rezultate. Tako da, potpuno očekivano, korelacija između plus/minus statistike (prosječna koš razlika po utakmici) i postotka pobjede je velika.
+
+### Graf postignutih i primljenih koševa ovisno o postotku pobjeda
+
+```{r}
+ptsScoredMean = mean(nbaRSFinal$ptsScoredAvg)
+ptsConcededMean = mean(nbaRSFinal$ptsConcededAvg)
+
+ggplot(nbaRSFinal, aes(x = ptsConcededAvg, y = ptsScoredAvg, alpha = teamWinPCT)) + 
+  geom_point(color = "blue") +
+  geom_hline(aes(yintercept = ptsConcededMean), color = "red") +
+  geom_vline(aes(xintercept = ptsScoredMean), color = "red") +
+  geom_abline(aes(intercept = 0, slope = 1), color = "red") +
+  theme_minimal()
+```
+
+### Graf broja asistencija o postotku pobjeda
+
+```{r}
+ggplot(nbaRSFinal, aes(x = astAvg, y = teamWinPCT)) + 
+  geom_point(color = "dodgerblue") +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1, scale = 100)) +
+  labs(title = "Povezanost broja asistencija s postotkom pobjeda",
+       x = "Prosječan broj asistencija",
+       y = "Postotak pobjeda") +
+  theme_minimal() -> g1
+cor.test(nbaRSFinal$astAvg, nbaRSFinal$teamWinPCT, method = "pearson")
+```
+
+### Graf ovisnosti broja izgubljenih lopti o postotku pobjeda
+
+```{r}
+ggplot(nbaRSFinal, aes(x = tovAvg, y = teamWinPCT)) + 
+  geom_point(color = "dodgerblue") +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1, scale = 100)) +
+  labs(title = "Povezanost broja izgubljenih lopti s postotkom pobjeda",
+       x = "Prosječan broj izgubljenih lopti",
+       y = "Postotak pobjeda") +
+  theme_minimal() -> g2
+
+grid.arrange(g1, g2) -> gggg
+ggsave("graf2.png", plot = gggg, width = 10, height = 8, dpi = 300)
+cor.test(nbaRSFinal$tovAvg, nbaRSFinal$teamWinPCT, method = "pearson")
+```
+
+## Modeli za predviđanje
+
+### Bez prvih 5
+
+```{r}
+nbaRS0 <- nbaRS4 %>% filter(gamesPlayedHome > 5) %>% select(team_name_home, team_name_away, game_date, matchup_home, homeTeamWinPCT, homeFGPCT, homeFG3PCT, homeFTPCT, oRebAvgHome, dRebAvgHome, rebAvgHome, astAvgHome, stlAvgHome, blkAvgHome, tovAvgHome, pfAvgHome, plus_minusAvgHome, awayTeamWinPCT, awayFGPCT, awayFG3PCT, awayFTPCT, oRebAvgAway, dRebAvgAway, rebAvgAway, astAvgAway, stlAvgAway, blkAvgAway, tovAvgAway, pfAvgAway, plus_minusAvgAway, homeH2HWins, awayH2HWins, winner)
+nbaRS0
+```
+
+### Bez prvih 10
+
+```{r}
+nbaRS10 <- nbaRS4 %>% filter(gamesPlayedHome > 10) %>% select(team_name_home, team_name_away, game_date, matchup_home, homeTeamWinPCT, homeFGPCT, homeFG3PCT, homeFTPCT, oRebAvgHome, dRebAvgHome, rebAvgHome, astAvgHome, stlAvgHome, blkAvgHome, tovAvgHome, pfAvgHome, plus_minusAvgHome, awayTeamWinPCT, awayFGPCT, awayFG3PCT, awayFTPCT, oRebAvgAway, dRebAvgAway, rebAvgAway, astAvgAway, stlAvgAway, blkAvgAway, tovAvgAway, pfAvgAway, plus_minusAvgAway, homeH2HWins, awayH2HWins, winner)
+nbaRS10
+```
+
+```{r}
+nbaRS0 %>% count(winner)
+```
+
+### Normalizacija podataka
+
+```{r}
+nbaRSNorm <- lapply(nbaRS0, function(x) {
+  if(is.numeric(x)) (x - mean(x)) / sd(x)
+  else x
+}) %>% as.data.frame
+```
+
+```{r}
+nbaRSNorm1 <- lapply(nbaRS10, function(x) {
+  if(is.numeric(x)) (x - mean(x)) / sd(x)
+  else x
+}) %>% as.data.frame
+```
+
+### Podjela na trening i test podatke
+
+#### Bez prvih 5
+
+```{r}
+trainingSet <- nbaRSNorm[1:27053,c(6:32)]
+testSet <- nbaRSNorm[27054:38648,c(6:32)]
+
+trainingOutcomes <- nbaRSNorm[1:27053,33]
+testOutcomes <- nbaRSNorm[27054:38648,33]
+
+trainingOutcomes <- as.factor(trainingOutcomes)
+testOutcomes <- as.factor(testOutcomes)
+```
+
+#### Bez prvih 10
+
+```{r}
+trainingSet <- nbaRSNorm1[1:25219,c(6:32)]
+testSet <- nbaRSNorm1[25220:36028,c(6:32)]
+
+trainingOutcomes <- nbaRSNorm1[1:25219,33]
+testOutcomes <- nbaRSNorm1[25220:36028,33]
+
+trainingOutcomes <- as.factor(trainingOutcomes)
+testOutcomes <- as.factor(testOutcomes)
+```
+
+### Random forest
+
+```{r}
+set.seed(3000)
+model <- randomForest(x = trainingSet, y = trainingOutcomes, ntree = 1000, mtry = 3, classwt = c(A = 1, H = 2), keep.forest = TRUE)
+predictions <- predict(model, newdata = testSet)
+
+accuracyRf <- mean(predictions == testOutcomes)
+print(paste("Accuracy:", round(accuracyRf, 4)))
+
+conf_matrix <- confusionMatrix(predictions, testOutcomes, positive = "H")
+
+print(conf_matrix$table)
+cat("\n")
+
+```
+
+```{r}
+TP <- conf_matrix$table[2,2]
+FN <- conf_matrix$table[2,1]
+FP <- conf_matrix$table[1,2]
+TN <- conf_matrix$table[1,1]
+
+precision_H <- TP / (TP + FP)
+recall_H <- TP / (TP + FN)
+f1_H <- 2 * precision_H * recall_H / (precision_H + recall_H)
+
+precision_A <- TN / (TN + FN)
+recall_A <- TN / (TN + FP)
+f1_A <- 2 * precision_A * recall_A / (precision_A + recall_A)
+
+metrics <- data.frame(
+  Class = c("H", "A"),
+  Precision = c(precision_H, precision_A),
+  Recall = c(recall_H, recall_A),
+  F1 = c(f1_H, f1_A)
+)
+print(metrics)
+
+library(MLmetrics)
+
+F1_Score(y_true = testOutcomes, y_pred = predictions, positive = "H") -> f1H
+F1_Score(y_true = testOutcomes, y_pred = predictions) -> f1A
+
+f1Rf <- (f1A + f1H) / 2
+f1Rf
+```
+
+```{r}
+conf_matrix_df <- as.data.frame(as.table(conf_matrix))
+colnames(conf_matrix_df) <- c("Stvarno", "Predviđeno", "Count")
+
+conf_matrix_df$Stvarno <- factor(conf_matrix_df$Stvarno, levels = rev(c("A", "H")))
+conf_matrix_df$Predviđeno <- factor(conf_matrix_df$Predviđeno, levels = c("A", "H"))
+
+ggplot(conf_matrix_df, aes(x = Predviđeno, y = Stvarno, fill = Count)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Count), color = "white", size = 8, fontface = "bold") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  theme_minimal(base_size = 12) +
+  labs(title = "Matrica konfuzije za model Slučajne šume",
+       x = "Predviđeno", y = "Stvarno", fill = "Broj")
+ggsave("mat1.png", plot = last_plot(), bg = "white")
+```
+
+### Support Vector Machine
+
+```{r}
+svm_model <- svm(x = trainingSet, y = trainingOutcomes, 
+                 kernel = "radial")
+predictions <- predict(svm_model, newdata = testSet)
+
+accuracySvm <- mean(predictions == testOutcomes)
+print(paste("Accuracy:", round(accuracySvm, 4)))
+
+conf_matrix <- confusionMatrix(predictions, testOutcomes, positive = "H")
+
+print(conf_matrix$table)
+cat("\n")
+```
+
+```{r}
+TP <- conf_matrix$table[2,2]
+FN <- conf_matrix$table[2,1]
+FP <- conf_matrix$table[1,2]
+TN <- conf_matrix$table[1,1]
+
+precision_H <- TP / (TP + FP)
+recall_H <- TP / (TP + FN)
+f1_H <- 2 * precision_H * recall_H / (precision_H + recall_H)
+
+precision_A <- TN / (TN + FN)
+recall_A <- TN / (TN + FP)
+f1_A <- 2 * precision_A * recall_A / (precision_A + recall_A)
+
+metrics <- data.frame(
+  Class = c("H", "A"),
+  Precision = c(precision_H, precision_A),
+  Recall = c(recall_H, recall_A),
+  F1 = c(f1_H, f1_A)
+)
+print(metrics)
+
+library(MLmetrics)
+
+F1_Score(y_true = testOutcomes, y_pred = predictions, positive = "H") -> f1H
+F1_Score(y_true = testOutcomes, y_pred = predictions) -> f1A
+
+f1 <- (f1A + f1H) / 2
+f1
+```
+
+```{r}
+conf_matrix_df <- as.data.frame(as.table(conf_matrix))
+colnames(conf_matrix_df) <- c("Stvarno", "Predviđeno", "Count")
+
+conf_matrix_df$Stvarno <- factor(conf_matrix_df$Stvarno, levels = rev(c("A", "H")))
+conf_matrix_df$Predviđeno <- factor(conf_matrix_df$Predviđeno, levels = c("A", "H"))
+
+ggplot(conf_matrix_df, aes(x = Predviđeno, y = Stvarno, fill = Count)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Count), color = "white", size = 8, fontface = "bold") +
+  scale_fill_gradient(low = "orange", high = "darkred") +
+  theme_minimal(base_size = 12) +
+  labs(title = "Matrica konfuzije za model Stroj potpornog vektora", x = "Predviđeno", y = "Stvarno", fill = "Količina")
+ggsave("mat2.png", plot = last_plot(), bg = "white")
+
+F1_Score(y_true = testOutcomes, y_pred = predictions, positive = "H") -> f1H
+F1_Score(y_true = testOutcomes, y_pred = predictions) -> f1A
+
+f1Svm <- (f1A + f1H) / 2
+f1Svm <- 0.5913624
+```
+
+### Logistička regresija
+
+```{r}
+model <- multinom(trainingOutcomes ~ ., data = trainingSet)
+predictions <- predict(model, newdata = testSet)
+
+accuracyLr <- mean(predictions == testOutcomes)
+print(paste("Accuracy:", round(accuracyLr, 4)))
+
+conf_matrix <- confusionMatrix(predictions, testOutcomes, positive = "H")
+
+print(conf_matrix$table)
+cat("\n")
+```
+
+```{r}
+TP <- conf_matrix$table[2,2]
+FN <- conf_matrix$table[2,1]
+FP <- conf_matrix$table[1,2]
+TN <- conf_matrix$table[1,1]
+
+precision_H <- TP / (TP + FP)
+recall_H <- TP / (TP + FN)
+f1_H <- 2 * precision_H * recall_H / (precision_H + recall_H)
+
+precision_A <- TN / (TN + FN)
+recall_A <- TN / (TN + FP)
+f1_A <- 2 * precision_A * recall_A / (precision_A + recall_A)
+
+metrics <- data.frame(
+  Class = c("H", "A"),
+  Precision = c(precision_H, precision_A),
+  Recall = c(recall_H, recall_A),
+  F1 = c(f1_H, f1_A)
+)
+print(metrics)
+
+library(MLmetrics)
+
+F1_Score(y_true = testOutcomes, y_pred = predictions, positive = "H") -> f1H
+F1_Score(y_true = testOutcomes, y_pred = predictions) -> f1A
+
+f1Lr <- (f1A + f1H) / 2
+f1Lr
+```
+
+```{r}
+conf_matrix_df <- as.data.frame(as.table(conf_matrix))
+colnames(conf_matrix_df) <- c("Stvarno", "Predviđeno", "Count")
+
+conf_matrix_df$Stvarno <- factor(conf_matrix_df$Stvarno, levels = rev(c("A", "H")))
+conf_matrix_df$Predviđeno <- factor(conf_matrix_df$Predviđeno, levels = c("A", "H"))
+
+ggplot(conf_matrix_df, aes(x = Predviđeno, y = Stvarno, fill = Count)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Count), color = "white", size = 8, fontface = "bold") +
+  scale_fill_gradient(low = "greenyellow", high = "darkgreen") +
+  theme_minimal(base_size = 12) +
+  labs(title = "Matrica konfuzije za model Logističke regresije", x = "Predviđeno", y = "Stvarno", fill = "Količina")
+ggsave("mat3.png", plot = last_plot(), bg = "white")
+```
+
+```{r}
+accuracyRf
+accuracySvm
+accuracyLr
+f1Rf
+f1Svm
+f1Lr
+```
+
+```{r}
+pom <- data.frame(rf = c(accuracyRf, f1Rf), svm = c(accuracySvm, f1Svm),lr = c(accuracyLr, f1Lr))
+pom
+```
+
+```{r}
+library(tidyverse)
+
+df <- data.frame(
+  Model = c("Accuracy", "F1 Score"),
+  RF = c(0.6484411, 0.6221543),
+  SVM = c(0.6372467, 0.5913624),
+  LR = c(0.6500139, 0.6172152)
+)
+df_long <- df %>%
+  pivot_longer(cols = -Model, names_to = "Algoritam", values_to = "Vrijednost")
+
+ggplot(df_long, aes(x = Model, y = Vrijednost, fill = Algoritam)) +
+  geom_col(position = "dodge", width = 0.6) +
+  scale_fill_manual(values = c("RF" = "darkblue", 
+                             "SVM" = "orange", 
+                             "LR" = "greenyellow")) +
+  labs(title = "Usporedba modela po algoritmu",
+       x = "Metrika",
+       y = "Vrijednost",
+       fill = "Algoritam") +
+  theme_minimal()
+ggsave("usp.png", bg = "white")
+```
